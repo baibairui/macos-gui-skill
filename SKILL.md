@@ -23,15 +23,26 @@ Runtime:
 
 Examples:
 - `node ./scripts/macos-gui-skill.mjs observe --label inbox --show-cursor true`
+- `node ./scripts/macos-gui-skill.mjs observe --active-window true`
+- `node ./scripts/macos-gui-skill.mjs observe --region 10,20,300,400`
 - `node ./scripts/macos-gui-skill.mjs act --steps '[{"type":"activate-app","appName":"Finder"},{"type":"hotkey","keys":["Meta","n"]}]'`
 - `node ./scripts/macos-gui-skill.mjs click --x 640 --y 420 --button left`
 - `node ./scripts/macos-gui-skill.mjs screenshot --filename desktop-step.png --show-cursor true`
+- `node ./scripts/macos-gui-skill.mjs doctor`
+- `node ./scripts/macos-gui-skill.mjs list-windows`
+- `node ./scripts/macos-gui-skill.mjs window-bounds --app-name Finder`
+- `node ./scripts/macos-gui-skill.mjs locate-image --image ./button-template.png --active-window true`
+- `node ./scripts/macos-gui-skill.mjs locate-image-center --image ./button-template.png --source-image ./capture.png`
 - `node ./scripts/macos-gui-skill.mjs run-applescript --script 'tell application "Finder" to activate'`
 - `node ./scripts/macos-gui-skill.mjs run-shell --command 'open -a "System Settings"'`
 
 Rules:
 - Operate the frontmost visible application only.
 - Treat every `observe` result as visual evidence. Do not guess the UI state from stale memory.
+- Prefer `observe --active-window true` or `observe --region ...` when full-screen captures include irrelevant context.
+- Use `list-windows` or `window-bounds` to learn the current window layout before narrowing the capture area.
+- Use `doctor` when permission state or local dependency state is unclear.
+- Use `locate-image` or `locate-image-center` when the next action depends on finding a stable visual template in a PNG screenshot.
 - Use `act` for the default path. Each bundle should stay inside one obvious focus chain and contain only GUI actions.
 - If the host window steals focus between invocations, `observe` and `act` restore the remembered target app before continuing.
 - Do not start with `run-shell` or `run-applescript`. If shell or AppleScript is required, use them only after repeated visual ambiguity or explicit user instruction.
@@ -39,3 +50,17 @@ Rules:
 - If the next action is ambiguous, stop and ask for user direction.
 - Before send/delete/submit/payment or other irreversible actions, request confirmation if the user did not state it explicitly.
 - If an action fails twice, stop and report the current frontmost app and latest screenshot path.
+
+Observation return fields:
+- `path` and `local_image_path` for the captured image
+- `frontmostApp`
+- `screenSize`
+- `captureRegion`
+- `coordinateSpace`
+- `permissions`
+
+Template matching notes:
+- `locate-image` returns `found`, `confidence`, `boundingBox`, and `center`.
+- `locate-image-center` returns `found`, `confidence`, and `center`.
+- Both commands accept `--source-image` for an existing PNG or will take a fresh screenshot if omitted.
+- Both commands perform PNG template matching only. They do not read text from the UI.

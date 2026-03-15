@@ -8,7 +8,8 @@
     "macos-gui-skill": "./scripts/macos-gui-skill.mjs"
   },
   "scripts": {
-    "check": "node ./scripts/macos-gui-skill.mjs --help"
+    "check": "node ./scripts/macos-gui-skill.mjs --help",
+    "test": "node --test"
   },
   "keywords": [
     "codex-skill",
@@ -19,6 +20,7 @@
   ],
   "license": "MIT",
   "dependencies": {
-    "@nut-tree-fork/nut-js": "^4.2.6"
+    "@nut-tree-fork/nut-js": "^4.2.6",
+    "pngjs": "^7.0.0"
   }
 }

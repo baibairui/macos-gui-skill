@@ -7,12 +7,14 @@ import { execFile } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
+import { PNG } from 'pngjs';
 
 const execFileAsync = promisify(execFile);
 const argv = process.argv.slice(2);
 const requireFromSkill = createRequire(import.meta.url);
 const requireFromCwd = createRequire(path.join(process.cwd(), '__macos-gui-skill__.cjs'));
 const HOST_APP_NAMES = new Set(['Codex', 'Terminal', 'iTerm2', 'Warp', 'Ghostty', 'Visual Studio Code', 'Cursor']);
+const TEST_STATE = loadTestState();
 let nutJsPromise;
 if (argv.length === 0 || argv.includes('--help') || argv.includes('-h')) {
   printHelp();
@@ -47,6 +49,11 @@ function printHelp() {
     '  press-key --key <key>',
     '  hotkey --keys Meta,Shift,4',
     '  screenshot [--app-name <name>] [--filename desktop-step.png] [--show-cursor true] [--settle-ms 350]',
+    '  doctor',
+    '  list-windows',
+    '  window-bounds [--app-name <name>] [--active-window true]',
+    '  locate-image --image <template.png> [--source-image <capture.png>] [--confidence 0.98]',
+    '  locate-image-center --image <template.png> [--source-image <capture.png>] [--confidence 0.98]',
     '  run-applescript --script <value>',
     '  run-shell --command <value>',
   ].join('\n'));
@@ -58,6 +65,12 @@ async function execute(command, args) {
   }
   if (command === 'act') {
     return act(args.steps);
+  }
+  if (command === 'locate-image') {
+    return locateImage(args, false);
+  }
+  if (command === 'locate-image-center') {
+    return locateImage(args, true);
   }
   return executeAtomic(command, args);
 }
@@ -128,8 +141,26 @@ async function executeAtomic(command, args) {
     }
     case 'screenshot': {
       const frontmostApp = await maybeRestoreRememberedApp({ appName: args.appName, settleMs: args.settleMs ?? 350 });
-      const filePath = await takeScreenshot(args);
-      return { text: filePath, data: { path: filePath, frontmostApp } };
+      const screenshot = await takeScreenshot(args);
+      return { text: screenshot.path, data: { path: screenshot.path, frontmostApp, captureRegion: screenshot.captureRegion ?? null } };
+    }
+    case 'doctor': {
+      const doctor = await readDoctorData();
+      return { text: 'desktop environment diagnostics collected', data: doctor };
+    }
+    case 'list-windows': {
+      await ensureAccessibilityAccess();
+      const windows = await readWindows();
+      return { text: `listed ${windows.length} windows`, data: { windows } };
+    }
+    case 'window-bounds': {
+      await ensureAccessibilityAccess();
+      const windows = await readWindows();
+      const win = pickWindow(windows, args);
+      if (!win) {
+        throw new Error('no matching window found');
+      }
+      return { text: `window bounds for ${win.appName}`, data: { window: win, bounds: win.bounds } };
     }
     case 'run-applescript': {
       const result = await runAppleScript(args.script, 'the requested application');
@@ -147,22 +178,74 @@ async function executeAtomic(command, args) {
 async function observe(input) {
   const frontmostApp = await maybeRestoreRememberedApp({ appName: input.appName, settleMs: input.settleMs ?? 350 });
   const filename = input.filename ?? defaultObserveFilename(input.label, frontmostApp);
-  const filePath = await takeScreenshot({ filename, showCursor: input.showCursor === true });
-  return { text: `observed ${frontmostApp}`, data: { path: filePath, local_image_path: filePath, frontmostApp, label: input.label ?? null } };
+  const screenshot = await takeScreenshot({ filename, showCursor: input.showCursor === true, region: input.region, appName: input.appName, activeWindow: input.activeWindow });
+  const doctor = await readDoctorData();
+  return {
+    text: `observed ${frontmostApp}`,
+    data: {
+      path: screenshot.path,
+      local_image_path: screenshot.path,
+      frontmostApp,
+      label: input.label ?? null,
+      screenSize: doctor.environment.screenSize,
+      captureRegion: screenshot.captureRegion ?? null,
+      coordinateSpace: doctor.environment.coordinateSpace,
+      permissions: doctor.permissions,
+    },
+  };
 }
 
 async function act(steps) {
   validateActionBundle(steps);
+  const screenSize = await readScreenSize().catch(() => undefined);
   await maybeRestoreRememberedApp({ settleMs: 350 });
   const executed = [];
   for (const step of steps) {
-    const normalized = normalizeActionStep(step);
+    const normalized = normalizeActionStep(step, { screenSize });
     const result = await executeAtomic(normalized.command, normalized.args);
     executed.push({ type: normalized.command, text: result.text, data: result.data ?? null });
   }
   const frontmostApp = await getFrontmostApp().catch(() => '');
   rememberDesktopApp(frontmostApp);
   return { text: `executed ${executed.length} bundled actions`, data: { steps: executed, frontmostApp: frontmostApp || null } };
+}
+
+async function locateImage(args, returnCenterOnly) {
+  const sourceImage = await resolveSourceImage(args);
+  const match = findTemplateMatch(readPngFile(sourceImage.path), readPngFile(args.image), args.confidence);
+  if (!match) {
+    return {
+      text: 'template not found',
+      data: {
+        found: false,
+        sourceImage: sourceImage.path,
+        confidenceThreshold: args.confidence,
+      },
+    };
+  }
+  if (returnCenterOnly) {
+    return {
+      text: `template center at ${match.center.x},${match.center.y}`,
+      data: {
+        found: true,
+        confidence: match.confidence,
+        center: match.center,
+        sourceImage: sourceImage.path,
+        searchRegion: sourceImage.captureRegion ?? null,
+      },
+    };
+  }
+  return {
+    text: `template found at ${match.boundingBox.left},${match.boundingBox.top}`,
+    data: {
+      found: true,
+      confidence: match.confidence,
+      boundingBox: match.boundingBox,
+      center: match.center,
+      sourceImage: sourceImage.path,
+      searchRegion: sourceImage.captureRegion ?? null,
+    },
+  };
 }
 
 function validateActionBundle(steps) {
@@ -182,7 +265,22 @@ function validateActionBundle(steps) {
   }
 }
 
-function normalizeActionStep(step) {
+async function resolveSourceImage(args) {
+  if (args.sourceImage) {
+    return { path: path.resolve(args.sourceImage), captureRegion: args.region ?? null };
+  }
+  const frontmostApp = await maybeRestoreRememberedApp({ appName: args.appName, settleMs: args.settleMs ?? 350 });
+  const filename = defaultObserveFilename('locate-image', frontmostApp);
+  return takeScreenshot({
+    filename,
+    showCursor: false,
+    region: args.region,
+    appName: args.appName,
+    activeWindow: args.activeWindow,
+  });
+}
+
+function normalizeActionStep(step, context = {}) {
   if (!step || typeof step !== 'object' || Array.isArray(step)) {
     throw new Error('action bundle step must be an object');
   }
@@ -192,23 +290,52 @@ function normalizeActionStep(step) {
     case 'activate-app':
       return { command: 'activate-app', args: { appName: stringValue(step.appName ?? step['app-name']) } };
     case 'move-mouse':
-      return { command: 'move-mouse', args: { x: requiredNumber(step.x, 'step.x'), y: requiredNumber(step.y, 'step.y') } };
+      return {
+        command: 'move-mouse',
+        args: {
+          x: requiredPointNumber(step.x, 'step.x', context.screenSize),
+          y: requiredPointNumber(step.y, 'step.y', context.screenSize, 'y'),
+        },
+      };
     case 'click':
-      return { command: 'click', args: { x: optionalNumber(step.x), y: optionalNumber(step.y), button: optionalString(step.button) ?? 'left', double: booleanValue(step.double) } };
+      return {
+        command: 'click',
+        args: {
+          x: optionalPointNumber(step.x, 'step.x', context.screenSize),
+          y: optionalPointNumber(step.y, 'step.y', context.screenSize, 'y'),
+          button: optionalString(step.button) ?? 'left',
+          double: booleanValue(step.double),
+        },
+      };
     case 'drag':
-      return { command: 'drag', args: { from: { x: requiredNumber(step.from?.x, 'step.from.x'), y: requiredNumber(step.from?.y, 'step.from.y') }, to: { x: requiredNumber(step.to?.x, 'step.to.x'), y: requiredNumber(step.to?.y, 'step.to.y') } } };
+      return {
+        command: 'drag',
+        args: {
+          from: {
+            x: requiredPointNumber(step.from?.x, 'step.from.x', context.screenSize),
+            y: requiredPointNumber(step.from?.y, 'step.from.y', context.screenSize, 'y'),
+          },
+          to: {
+            x: requiredPointNumber(step.to?.x, 'step.to.x', context.screenSize),
+            y: requiredPointNumber(step.to?.y, 'step.to.y', context.screenSize, 'y'),
+          },
+        },
+      };
     case 'type-text':
       return { command: 'type-text', args: { text: stringValue(step.text) } };
     case 'press-key':
       return { command: 'press-key', args: { key: stringValue(step.key) } };
     case 'hotkey':
-      return { command: 'hotkey', args: { keys: arrayValue(step.keys) } };
+      return { command: 'hotkey', args: { keys: nonEmptyArrayValue(step.keys, 'step.keys') } };
     default:
       throw new Error(`unsupported action bundle step: ${step.type}`);
   }
 }
 
 async function getFrontmostApp() {
+  if (TEST_STATE?.frontmostApp) {
+    return TEST_STATE.frontmostApp;
+  }
   await ensureAccessibilityAccess();
   const result = await runAppleScript('tell application "System Events" to get name of first application process whose frontmost is true', 'System Events');
   return result.stdout.trim();
@@ -221,6 +348,10 @@ async function launchAppName(appName, settleMs) {
 }
 
 async function activateAppName(appName, settleMs) {
+  if (TEST_STATE) {
+    await sleep(settleMs);
+    return;
+  }
   await runAppleScript(`tell application ${appleScriptString(appName)} to activate`, appName);
   await sleep(settleMs);
 }
@@ -283,10 +414,11 @@ async function takeScreenshot(input) {
   fs.mkdirSync(artifactDir, { recursive: true });
   const filename = input.filename?.trim() || `desktop-${Date.now()}.png`;
   const filePath = path.isAbsolute(filename) ? filename : path.join(artifactDir, filename);
+  const captureRegion = await resolveCaptureRegion(input);
   if (fs.existsSync(filePath)) {
     fs.rmSync(filePath, { force: true });
   }
-  const capturedNatively = await tryCaptureScreen(filePath, input.showCursor === true);
+  const capturedNatively = await tryCaptureScreen(filePath, input.showCursor === true, captureRegion);
   if (!capturedNatively) {
     const nutJs = await loadNutJs();
     const parsed = path.parse(filePath);
@@ -299,7 +431,24 @@ async function takeScreenshot(input) {
     throw new Error(`Desktop screenshot was not created at expected path: ${filePath}`);
   }
   await normalizeScreenshotToCoordinateSpace(filePath);
-  return filePath;
+  return { path: filePath, captureRegion };
+}
+
+async function resolveCaptureRegion(input = {}) {
+  if (input.region) {
+    return input.region;
+  }
+  if (input.activeWindow) {
+    const windows = await readWindows();
+    const win = pickWindow(windows, { activeWindow: true });
+    return win ? { ...win.bounds, source: 'active-window' } : undefined;
+  }
+  if (input.appName) {
+    const windows = await readWindows();
+    const win = pickWindow(windows, { appName: input.appName });
+    return win ? { ...win.bounds, source: 'app-window' } : undefined;
+  }
+  return undefined;
 }
 
 function resolveArtifactDir() {
@@ -337,6 +486,12 @@ function rememberDesktopApp(appName) {
 }
 
 async function ensureAccessibilityAccess() {
+  if (TEST_STATE?.permissions) {
+    if (TEST_STATE.permissions.accessibility) {
+      return;
+    }
+    throw new Error('Accessibility permission is required for mouse, keyboard, and window-state operations.');
+  }
   const result = await run('swift', ['-e', 'import ApplicationServices; let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary; print(AXIsProcessTrustedWithOptions(options))']);
   if (result.stdout.trim() === 'true') {
     return;
@@ -346,6 +501,12 @@ async function ensureAccessibilityAccess() {
 }
 
 async function ensureScreenCaptureAccess() {
+  if (TEST_STATE?.permissions) {
+    if (TEST_STATE.permissions.screenRecording) {
+      return;
+    }
+    throw new Error('Screen Recording permission is not granted for the current host application.');
+  }
   const result = await run('swift', ['-e', 'import CoreGraphics; print(CGPreflightScreenCaptureAccess())']);
   if (result.stdout.trim() === 'true') {
     return;
@@ -384,9 +545,14 @@ function isAppleEventsPermissionError(message) {
   return /-1743|not authorized to send apple events|not permitted to send apple events|automation permission/i.test(String(message).toLowerCase());
 }
 
-async function tryCaptureScreen(filePath, showCursor) {
+async function tryCaptureScreen(filePath, showCursor, region) {
+  if (TEST_STATE) {
+    fs.writeFileSync(filePath, `test screenshot ${showCursor ? 'cursor' : 'plain'}\n`, 'utf8');
+    return true;
+  }
   try {
-    await run('screencapture', [...(showCursor ? ['-C'] : []), '-x', filePath]);
+    const regionArgs = region ? ['-R', `${Math.round(region.x)},${Math.round(region.y)},${Math.round(region.width)},${Math.round(region.height)}`] : [];
+    await run('screencapture', [...(showCursor ? ['-C'] : []), ...regionArgs, '-x', filePath]);
   } catch {
     return false;
   }
@@ -394,6 +560,9 @@ async function tryCaptureScreen(filePath, showCursor) {
 }
 
 async function normalizeScreenshotToCoordinateSpace(filePath) {
+  if (TEST_STATE) {
+    return;
+  }
   const screenSize = await readScreenSize().catch(() => undefined);
   if (!screenSize || screenSize.width <= 0 || screenSize.height <= 0) {
     return;
@@ -415,6 +584,9 @@ async function normalizeScreenshotToCoordinateSpace(filePath) {
 }
 
 async function readScreenSize() {
+  if (TEST_STATE?.screenSize) {
+    return TEST_STATE.screenSize;
+  }
   const nutJs = await loadNutJs();
   return {
     width: await nutJs.screen.width(),
@@ -423,6 +595,9 @@ async function readScreenSize() {
 }
 
 async function readImageSize(filePath) {
+  if (TEST_STATE?.imageSize) {
+    return TEST_STATE.imageSize;
+  }
   const result = await run('sips', ['-g', 'pixelWidth', '-g', 'pixelHeight', filePath]);
   const width = Number(result.stdout.match(/pixelWidth:\s*(\d+)/)?.[1] ?? 0);
   const height = Number(result.stdout.match(/pixelHeight:\s*(\d+)/)?.[1] ?? 0);
@@ -454,6 +629,9 @@ function appleScriptString(value) {
 }
 
 function assertSupportedPlatform() {
+  if (TEST_STATE) {
+    return;
+  }
   if (process.platform !== 'darwin') {
     throw new Error('macos-gui-skill direct mode only supports macOS hosts');
   }
@@ -488,11 +666,35 @@ function parseArgs(tokens) {
 function normalizeArgs(command, parsed) {
   switch (command) {
     case 'observe':
-      return { appName: optionalString(parsed["app-name"] ?? parsed.appName), filename: optionalString(parsed.filename), label: optionalString(parsed.label), showCursor: booleanValue(parsed["show-cursor"] ?? parsed.showCursor), settleMs: optionalNumber(parsed["settle-ms"] ?? parsed.settleMs) ?? 350 };
+      return {
+        appName: optionalString(parsed["app-name"] ?? parsed.appName),
+        filename: optionalString(parsed.filename),
+        label: optionalString(parsed.label),
+        showCursor: booleanValue(parsed["show-cursor"] ?? parsed.showCursor),
+        settleMs: optionalNumber(parsed["settle-ms"] ?? parsed.settleMs) ?? 350,
+        region: optionalRegion(parsed.region),
+        activeWindow: booleanValue(parsed["active-window"] ?? parsed.activeWindow),
+      };
     case 'act': {
       const steps = jsonArrayValue(parsed.steps, '--steps');
       return { steps };
     }
+    case 'doctor':
+    case 'list-windows':
+      return {};
+    case 'window-bounds':
+      return { appName: optionalString(parsed["app-name"] ?? parsed.appName), activeWindow: booleanValue(parsed["active-window"] ?? parsed.activeWindow) };
+    case 'locate-image':
+    case 'locate-image-center':
+      return {
+        image: path.resolve(stringValue(parsed.image)),
+        sourceImage: optionalString(parsed["source-image"] ?? parsed.sourceImage),
+        confidence: optionalNumber(parsed.confidence) ?? 0.98,
+        appName: optionalString(parsed["app-name"] ?? parsed.appName),
+        settleMs: optionalNumber(parsed["settle-ms"] ?? parsed.settleMs) ?? 350,
+        region: optionalRegion(parsed.region),
+        activeWindow: booleanValue(parsed["active-window"] ?? parsed.activeWindow),
+      };
     case 'frontmost-app':
       return {};
     case 'launch-app':
@@ -519,7 +721,14 @@ function normalizeArgs(command, parsed) {
     case 'hotkey':
       return { keys: arrayValue(parsed.keys) };
     case 'screenshot':
-      return { appName: optionalString(parsed["app-name"] ?? parsed.appName), filename: optionalString(parsed.filename), showCursor: booleanValue(parsed["show-cursor"] ?? parsed.showCursor), settleMs: optionalNumber(parsed["settle-ms"] ?? parsed.settleMs) ?? 350 };
+      return {
+        appName: optionalString(parsed["app-name"] ?? parsed.appName),
+        filename: optionalString(parsed.filename),
+        showCursor: booleanValue(parsed["show-cursor"] ?? parsed.showCursor),
+        settleMs: optionalNumber(parsed["settle-ms"] ?? parsed.settleMs) ?? 350,
+        region: optionalRegion(parsed.region),
+        activeWindow: booleanValue(parsed["active-window"] ?? parsed.activeWindow),
+      };
     case 'run-applescript':
       return { script: stringValue(parsed.script) };
     case 'run-shell':
@@ -534,6 +743,14 @@ function arrayValue(value) {
     return value.map((item) => String(item).trim()).filter(Boolean);
   }
   return typeof value === 'string' && value.trim() ? value.split(',').map((item) => item.trim()).filter(Boolean) : [];
+}
+
+function nonEmptyArrayValue(value, flagName) {
+  const items = arrayValue(value);
+  if (items.length === 0) {
+    throw new Error(`${flagName} requires at least one key`);
+  }
+  return items;
 }
 
 function jsonArrayValue(value, flagName) {
@@ -571,6 +788,45 @@ function requiredNumber(value, flagName) {
 function optionalNumber(value) {
   const next = Number(value);
   return Number.isFinite(next) ? next : undefined;
+}
+
+function requiredPointNumber(value, flagName, screenSize, axis = 'x') {
+  const next = requiredNumber(value, flagName);
+  validatePointWithinScreen(next, flagName, screenSize, axis);
+  return next;
+}
+
+function optionalPointNumber(value, flagName, screenSize, axis = 'x') {
+  const next = optionalNumber(value);
+  if (next === undefined) {
+    return undefined;
+  }
+  validatePointWithinScreen(next, flagName, screenSize, axis);
+  return next;
+}
+
+function validatePointWithinScreen(value, flagName, screenSize, axis = 'x') {
+  if (value < 0) {
+    throw new Error(`${flagName} must be within the current screen bounds`);
+  }
+  if (!screenSize) {
+    return;
+  }
+  const limit = axis === 'y' ? screenSize.height : screenSize.width;
+  if (Number.isFinite(limit) && value > limit) {
+    throw new Error(`${flagName} must be within the current screen bounds`);
+  }
+}
+
+function optionalRegion(value) {
+  if (typeof value !== 'string' || !value.trim()) {
+    return undefined;
+  }
+  const parts = value.split(',').map((item) => Number(item.trim()));
+  if (parts.length !== 4 || parts.some((item) => !Number.isFinite(item))) {
+    fail('missing or invalid --region');
+  }
+  return { x: parts[0], y: parts[1], width: parts[2], height: parts[3], source: 'region' };
 }
 
 function booleanValue(value) {
@@ -633,4 +889,263 @@ function mapNutKey(nutJs, key) {
 function fail(message) {
   process.stderr.write(`${message}\n`);
   process.exit(1);
+}
+
+function loadTestState() {
+  if (!process.env.MACOS_GUI_SKILL_TEST_STATE) {
+    return undefined;
+  }
+  try {
+    return JSON.parse(process.env.MACOS_GUI_SKILL_TEST_STATE);
+  } catch (error) {
+    throw new Error(`invalid MACOS_GUI_SKILL_TEST_STATE: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+async function readDoctorData() {
+  const [screenSize, permissions, dependencyResolved] = await Promise.all([
+    readScreenSize().catch(() => undefined),
+    readPermissions(),
+    resolveNutJsStatus(),
+  ]);
+  return {
+    permissions,
+    dependencies: {
+      nutJs: dependencyResolved,
+    },
+    environment: {
+      platform: TEST_STATE ? 'darwin' : process.platform,
+      screenSize: screenSize ?? null,
+      coordinateSpace: {
+        origin: 'top-left',
+        units: 'points',
+        normalizedScreenshot: true,
+      },
+    },
+  };
+}
+
+async function readPermissions() {
+  if (TEST_STATE?.permissions) {
+    return {
+      accessibility: Boolean(TEST_STATE.permissions.accessibility),
+      screenRecording: Boolean(TEST_STATE.permissions.screenRecording),
+      automation: Boolean(TEST_STATE.permissions.automation),
+    };
+  }
+  const [accessibility, screenRecording, automation] = await Promise.all([
+    checkAccessibilityPermission(),
+    checkScreenRecordingPermission(),
+    checkAutomationPermission(),
+  ]);
+  return { accessibility, screenRecording, automation };
+}
+
+async function checkAccessibilityPermission() {
+  const result = await run('swift', ['-e', 'import ApplicationServices; print(AXIsProcessTrusted())']).catch(() => ({ stdout: 'false' }));
+  return result.stdout.trim() === 'true';
+}
+
+async function checkScreenRecordingPermission() {
+  const result = await run('swift', ['-e', 'import CoreGraphics; print(CGPreflightScreenCaptureAccess())']).catch(() => ({ stdout: 'false' }));
+  return result.stdout.trim() === 'true';
+}
+
+async function checkAutomationPermission() {
+  try {
+    await run('osascript', ['-e', 'tell application "System Events" to get name of first process']);
+    return true;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (isAppleEventsPermissionError(message)) {
+      return false;
+    }
+    return false;
+  }
+}
+
+async function resolveNutJsStatus() {
+  try {
+    const specifier = resolveNutJsSpecifier();
+    return { resolved: true, specifier };
+  } catch (error) {
+    return { resolved: false, message: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+function readPngFile(filePath) {
+  if (!fs.existsSync(filePath)) {
+    throw new Error(`image file not found: ${filePath}`);
+  }
+  return PNG.sync.read(fs.readFileSync(filePath));
+}
+
+function findTemplateMatch(source, template, minConfidence) {
+  if (template.width > source.width || template.height > source.height) {
+    return null;
+  }
+  const anchors = buildTemplateAnchors(template, 24);
+  let best = null;
+  for (let top = 0; top <= source.height - template.height; top += 1) {
+    for (let left = 0; left <= source.width - template.width; left += 1) {
+      if (!matchesAnchors(source, template, left, top, anchors)) {
+        continue;
+      }
+      const confidence = scoreTemplateAt(source, template, left, top);
+      if (confidence < minConfidence) {
+        continue;
+      }
+      if (!best || confidence > best.confidence) {
+        const boundingBox = {
+          left,
+          top,
+          width: template.width,
+          height: template.height,
+          center_x: left + Math.floor(template.width / 2),
+          center_y: top + Math.floor(template.height / 2),
+        };
+        best = {
+          confidence: Number(confidence.toFixed(4)),
+          boundingBox,
+          center: { x: boundingBox.center_x, y: boundingBox.center_y },
+        };
+        if (confidence >= 0.9999) {
+          return best;
+        }
+      }
+    }
+  }
+  return best;
+}
+
+function buildTemplateAnchors(template, maxAnchors) {
+  const anchors = [];
+  const totalPixels = template.width * template.height;
+  const stride = Math.max(1, Math.floor(Math.sqrt(totalPixels / maxAnchors)));
+  for (let y = 0; y < template.height; y += stride) {
+    for (let x = 0; x < template.width; x += stride) {
+      const idx = pixelIndex(template.width, x, y);
+      if (template.data[idx + 3] === 0) {
+        continue;
+      }
+      anchors.push({ x, y, rgba: [template.data[idx], template.data[idx + 1], template.data[idx + 2], template.data[idx + 3]] });
+      if (anchors.length >= maxAnchors) {
+        return anchors;
+      }
+    }
+  }
+  if (anchors.length === 0) {
+    anchors.push({ x: 0, y: 0, rgba: [template.data[0], template.data[1], template.data[2], template.data[3]] });
+  }
+  return anchors;
+}
+
+function matchesAnchors(source, template, left, top, anchors) {
+  for (const anchor of anchors) {
+    const sourceIdx = pixelIndex(source.width, left + anchor.x, top + anchor.y);
+    if (!pixelRoughlyMatches(source.data, sourceIdx, anchor.rgba)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function scoreTemplateAt(source, template, left, top) {
+  let totalDiff = 0;
+  let totalChannels = 0;
+  for (let y = 0; y < template.height; y += 1) {
+    for (let x = 0; x < template.width; x += 1) {
+      const templateIdx = pixelIndex(template.width, x, y);
+      const alpha = template.data[templateIdx + 3];
+      if (alpha === 0) {
+        continue;
+      }
+      const sourceIdx = pixelIndex(source.width, left + x, top + y);
+      totalDiff += Math.abs(source.data[sourceIdx] - template.data[templateIdx]);
+      totalDiff += Math.abs(source.data[sourceIdx + 1] - template.data[templateIdx + 1]);
+      totalDiff += Math.abs(source.data[sourceIdx + 2] - template.data[templateIdx + 2]);
+      totalChannels += 3;
+    }
+  }
+  if (totalChannels === 0) {
+    return 0;
+  }
+  return 1 - totalDiff / (255 * totalChannels);
+}
+
+function pixelRoughlyMatches(data, idx, rgba) {
+  const tolerance = 12;
+  return Math.abs(data[idx] - rgba[0]) <= tolerance
+    && Math.abs(data[idx + 1] - rgba[1]) <= tolerance
+    && Math.abs(data[idx + 2] - rgba[2]) <= tolerance
+    && Math.abs(data[idx + 3] - rgba[3]) <= tolerance;
+}
+
+function pixelIndex(width, x, y) {
+  return (width * y + x) << 2;
+}
+
+async function readWindows() {
+  if (Array.isArray(TEST_STATE?.windows)) {
+    return TEST_STATE.windows;
+  }
+  const itemSeparator = '__MACOS_GUI_SKILL_ITEM__';
+  const fieldSeparator = '__MACOS_GUI_SKILL_FIELD__';
+  const script = [
+    'tell application "System Events"',
+    'set _items to {}',
+    'repeat with proc in (every application process whose background only is false)',
+    'repeat with win in (every window of proc)',
+    'try',
+    'set winPos to position of win',
+    'set winSize to size of win',
+    `set end of _items to ((name of proc as text) & "${fieldSeparator}" & (name of win as text) & "${fieldSeparator}" & (item 1 of winPos as text) & "${fieldSeparator}" & (item 2 of winPos as text) & "${fieldSeparator}" & (item 1 of winSize as text) & "${fieldSeparator}" & (item 2 of winSize as text))`,
+    'end try',
+    'end repeat',
+    'end repeat',
+    `set AppleScript's text item delimiters to "${itemSeparator}"`,
+    'set _output to _items as text',
+    `set AppleScript's text item delimiters to ""`,
+    'return _output',
+    'end tell',
+  ].join('\n');
+  const result = await runAppleScript(script, 'System Events');
+  const frontmostApp = await getFrontmostApp().catch(() => '');
+  return parseWindowsOutput(result.stdout, itemSeparator, fieldSeparator, frontmostApp);
+}
+
+function parseWindowsOutput(stdout, itemSeparator, fieldSeparator, frontmostApp) {
+  if (!stdout.trim()) {
+    return [];
+  }
+  return stdout
+    .split(itemSeparator)
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .map((item) => {
+      const [appName, title, x, y, width, height] = item.split(fieldSeparator);
+      return {
+        appName,
+        title,
+        bounds: {
+          x: Number(x),
+          y: Number(y),
+          width: Number(width),
+          height: Number(height),
+        },
+        active: appName === frontmostApp,
+      };
+    })
+    .filter((item) => item.appName && Number.isFinite(item.bounds.x) && Number.isFinite(item.bounds.y) && Number.isFinite(item.bounds.width) && Number.isFinite(item.bounds.height));
+}
+
+function pickWindow(windows, options = {}) {
+  if (options.activeWindow) {
+    return windows.find((item) => item.active) ?? windows[0];
+  }
+  if (options.appName) {
+    const lowered = options.appName.toLowerCase();
+    return windows.find((item) => item.appName.toLowerCase().includes(lowered));
+  }
+  return windows[0];
 }
