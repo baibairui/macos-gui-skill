@@ -908,7 +908,24 @@ async function readDoctorData() {
     readPermissions(),
     resolveNutJsStatus(),
   ]);
+  const blockers = [];
+  if (!permissions.accessibility) {
+    blockers.push('accessibility_permission_missing');
+  }
+  if (!permissions.screenRecording) {
+    blockers.push('screen_recording_permission_missing');
+  }
+  if (!dependencyResolved.resolved) {
+    blockers.push('nutjs_unavailable');
+  }
+  const actReady = blockers.length === 0;
   return {
+    actReady,
+    blockers,
+    recommendedCommand: 'doctor',
+    fallbackPolicy: actReady
+      ? 'prefer_act'
+      : 'do_not_fallback_until_doctor_is_reviewed',
     permissions,
     dependencies: {
       nutJs: dependencyResolved,
@@ -965,6 +982,9 @@ async function checkAutomationPermission() {
 }
 
 async function resolveNutJsStatus() {
+  if (TEST_STATE?.dependencyOverrides?.nutJs) {
+    return TEST_STATE.dependencyOverrides.nutJs;
+  }
   try {
     const specifier = resolveNutJsSpecifier();
     return { resolved: true, specifier };

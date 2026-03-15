@@ -41,7 +41,9 @@ Rules:
 - Treat every `observe` result as visual evidence. Do not guess the UI state from stale memory.
 - Prefer `observe --active-window true` or `observe --region ...` when full-screen captures include irrelevant context.
 - Use `list-windows` or `window-bounds` to learn the current window layout before narrowing the capture area.
-- Use `doctor` when permission state or local dependency state is unclear.
+- Run `doctor` before deciding that `act` is unavailable or before switching to shell or AppleScript fallbacks.
+- Do not claim the skill "lacks dependencies" unless `doctor` explicitly reports `actReady: false` and identifies the blocker.
+- Do not switch to system-level UI scripts just to probe the environment. Use `doctor` as the single source of truth for dependency and permission readiness.
 - Use `locate-image` or `locate-image-center` when the next action depends on finding a stable visual template in a PNG screenshot.
 - Use `act` for the default path. Each bundle should stay inside one obvious focus chain and contain only GUI actions.
 - If the host window steals focus between invocations, `observe` and `act` restore the remembered target app before continuing.
@@ -58,6 +60,13 @@ Observation return fields:
 - `captureRegion`
 - `coordinateSpace`
 - `permissions`
+
+Doctor return fields:
+- `actReady`
+- `blockers`
+- `fallbackPolicy`
+- `permissions`
+- `dependencies`
 
 Template matching notes:
 - `locate-image` returns `found`, `confidence`, `boundingBox`, and `center`.

@@ -36,12 +36,12 @@ const testState = {
   ],
 };
 
-function runCli(args) {
+function runCli(args, state = testState) {
   const result = spawnSync('node', [cliPath, ...args], {
     cwd: repoRoot,
     env: {
       ...process.env,
-      MACOS_GUI_SKILL_TEST_STATE: JSON.stringify(testState),
+      MACOS_GUI_SKILL_TEST_STATE: JSON.stringify(state),
     },
     encoding: 'utf8',
   });
@@ -101,8 +101,36 @@ test('doctor reports permissions and dependency resolution', () => {
     screenRecording: true,
     automation: false,
   });
+  assert.equal(output.data.actReady, true);
+  assert.deepEqual(output.data.blockers, []);
   assert.equal(output.data.dependencies.nutJs.resolved, true);
   assert.equal(output.data.environment.platform, 'darwin');
+});
+
+test('doctor reports act blockers instead of requiring fallback guesswork', () => {
+  const blockedState = {
+    ...testState,
+    permissions: {
+      accessibility: false,
+      screenRecording: true,
+      automation: false,
+    },
+    dependencyOverrides: {
+      nutJs: {
+        resolved: false,
+        message: 'failed to resolve @nut-tree-fork/nut-js from the current workspace or skill directory',
+      },
+    },
+  };
+  const output = parseJsonOutput(runCli(['doctor'], blockedState));
+
+  assert.equal(output.data.actReady, false);
+  assert.deepEqual(output.data.blockers, [
+    'accessibility_permission_missing',
+    'nutjs_unavailable',
+  ]);
+  assert.equal(output.data.recommendedCommand, 'doctor');
+  assert.equal(output.data.dependencies.nutJs.resolved, false);
 });
 
 test('list-windows and window-bounds return structured window data', () => {

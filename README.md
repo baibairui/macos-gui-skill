@@ -88,6 +88,18 @@ node ./scripts/macos-gui-skill.mjs locate-image-center --image ./button-template
 
 Use `--region x,y,width,height` to capture a specific area or `--active-window true` to target the active window bounds.
 
+## Doctor
+
+Run `doctor` before deciding that GUI actions are unavailable. It returns:
+
+- `actReady`
+- `blockers`
+- `fallbackPolicy`
+- `permissions`
+- `dependencies`
+
+If `actReady` is `false`, use the reported blockers to fix the environment first. Do not assume the skill lacks dependencies without checking `doctor`.
+
 ## Template Matching
 
 `locate-image` and `locate-image-center` search for a PNG template inside:
