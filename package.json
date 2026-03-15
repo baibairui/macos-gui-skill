@@ -1,0 +1,24 @@
+{
+  "name": "macos-gui-skill",
+  "version": "0.1.0",
+  "private": false,
+  "description": "A macOS desktop GUI skill for Codex-compatible agents.",
+  "type": "module",
+  "bin": {
+    "macos-gui-skill": "./scripts/macos-gui-skill.mjs"
+  },
+  "scripts": {
+    "check": "node ./scripts/macos-gui-skill.mjs --help"
+  },
+  "keywords": [
+    "codex-skill",
+    "desktop-automation",
+    "macos",
+    "gui",
+    "agent-skill"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@nut-tree-fork/nut-js": "^4.2.6"
+  }
+}
